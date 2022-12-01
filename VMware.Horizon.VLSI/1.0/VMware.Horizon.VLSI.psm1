@@ -150,6 +150,19 @@ function Get-ADDomainList() {
     }
 }
 
+function Get-ADContainerByDomain() {
+
+    param (
+        $sessionInfo,
+        $adContainerPayload
+    )
+    try {
+        return Invoke-HorizonPostMethod $sessionInfo "ADContainer/getContainerByDomain" $adContainerPayload
+    } catch {
+       Write-Host $_
+    }
+}
+
 function Get-ADContainerByRDN() {
 
     param (
@@ -172,6 +185,25 @@ function Get-VirtualCenterList() {
     } catch {
        Write-Host $_
     }
+}
+
+#
+# Expensive listing API call as it returns all the virtual machines belonging to specified vcenter
+# For automation, fetch it once and use it and reload it only when required!
+#
+# @Author: Neha Agarwal
+#
+function Get-VirtualMachineList() {
+	param (   
+		$sessionInfo ,
+		$vCenterIdentifier
+    )	
+
+	try {       
+		return Invoke-HorizonGetMethod $sessionInfo "VirtualMachine/list?id=$vCenterIdentifier"} 
+	catch { 
+		Write-Host $_
+	}
 }
 
 function Get-BaseImageVMList() {
@@ -362,6 +394,45 @@ function Convert-TreeAsHashMap() {
     }
 }
 
+#
+# Get the desktop pool filtered by name and virtual center identifier
+#
+function Get-DesktopPoolByName() {
+
+    param(
+        $sessionInfo,
+        $desktopPoolName,
+        $vCenterIdentifier
+    )
+
+	$payload = @{
+        entityType = "DesktopSummaryView"
+        queryEntityType = "DesktopSummaryView"
+        filter = @{ 
+            type = "Equals"
+            memberName = "desktopSummaryData.name"
+            value = $desktopPoolName
+        }
+    }
+    $responseData = $Null;
+    try {
+         $responseData = Invoke-HorizonPostMethod $sessionInfo "queryservice/create" $payload
+         if ( $responseData -ne $Null) {
+            Write-Host ($responseData | ConvertTo-JSON -depth 10)
+             # Cleanup the query resources
+             $payload = @{ id = $responseData.id }
+             Invoke-HorizonPostMethod $sessionInfo "queryservice/delete" $payload
+             if ($responseData.results[0].desktopSummaryData.virtualCenter -eq $vCenterIdentifier) {
+                return $responseData.results[0]
+             }
+             throw "No desktop pool found!";
+         }
+         
+    } catch {
+       Write-Host $_
+    }
+    return $Null
+}
 
 function Add-DesktopPool() {
 
@@ -377,24 +448,66 @@ function Add-DesktopPool() {
 }
 
 
+####################################################################
+# @Author: Neha Agarwal
+# Description: Add virtual machines to existing manual desktop pool
+####################################################################
+function Add-MachinesToManualDesktop()
+{
+	param (       
+		$sessionInfo,
+		$desktopId,
+		$vmIdList
+    )
+  
+	$payload = @{
+        id = $desktopId
+        machines = $vmIdList
+    }
+
+	try {
+       $response = Invoke-HorizonPostMethod $sessionInfo "Desktop/AddMachinesToManualDesktop" $payload
+       if ($response -ne $Null) {
+            if($response.message -ne $null) {
+                throw "Failed to add machine " + $response
+            } else{
+                Write-Host "Machines added to desktop pool!"
+                return $response
+            }
+       }
+    } catch {
+       Write-Host $_
+    }
+	return $Null
+}
+
 
 ###############
 # START HELPERS
 ###############
 
 
+# Credits to Matt Frey for adding PSCredential
 function Send-LoginCS () {
     param(
-        $username,
-        $domain,
-        $servername
+        $servername,
+        
+        $ignoreCert,
+        [ValidateNotNull()]
+        [System.Management.Automation.PSCredential]
+        [System.Management.Automation.Credential()]
+        $Credential = [System.Management.Automation.PSCredential]::Empty
     )
-    $pwd_secure_string = Read-Host "Enter a Password" -AsSecureString
-    $plainTextPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwd_secure_string))
+
+
+    if ($PSBoundParameters.ContainsKey('credential')) {
+
+    }
+
     $loginParams = @{
-        name = $username
-        passwd = $plainTextPassword
-        domain = $domain
+        name = $Credential.GetNetworkCredential().UserName
+        passwd = $Credential.GetNetworkCredential().Password
+        domain = $Credential.GetNetworkCredential().Domain
     }
     $server=$servername
 
@@ -404,8 +517,6 @@ function Send-LoginCS () {
 
     # Reset login payload.
     $loginParams = "";
-    # Reset plain password immediately after login.
-    $plainTextPassword="";
 
     return $sessionInfo;
 }
@@ -419,11 +530,15 @@ function Get-ADDomainInfo() {
     $adDomains = Get-ADDomainList $sessionInfo
 
     # Select domain identifier from dnsName and IC domain admin user name
-    $icDomain=""
+    $icDomain = $Null
     foreach($data in $adDomains) {
        if ($icDomainDNS -eq $data.namesData.dnsName -And $data.base.userName -eq $icDomainAdminName) {
          $icDomain=$data
+         break;
        }
+    }
+    if ($icDomain -eq $Null) {
+        throw "AD Domain information not found. Check the domain dnsname input and ensure no space append at the end."
     }
     return $icDomain
 }
@@ -436,21 +551,21 @@ function Get-ADContainerIdentifier() {
        $icDomainID,
        $adContainerVDI
     )
-    # Payload to find AD Container by RDN
+    
+    $parts = $icDomainID.split("/");
+    $domainSIDEncoded = $parts[$parts.length - 1];
+    $domainIDEncoded = $parts[$parts.length - 2];
+    $adContainerIdentifier = "ADContainer/$domainIDEncoded/$domainSIDEncoded/" + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($adContainerVDI))
+    # Payload to find AD Container by Identifier
     $adContainerByIdPayload = @{
         domain = "$icDomainID"
-        containerRDN = "$adContainerVDI"
+        containerId = "$adContainerIdentifier"
     }
-
-    $adContainerInfo = Get-ADContainerByRDN $sessionInfo $adContainerByIdPayload
-    $adContainerIdentifier = ""
-    # Now, lets find the ADContainerIdentifier
-    foreach($data in $adContainerInfo) {
-        if ($adContainerVDI -eq $data.rdn) {
-            $adContainerIdentifier=$data.id
-        }
+    $adIdentifierInfo = Get-ADContainerByDomain $sessionInfo $adContainerByIdPayload
+    if ($adIdentifierInfo -eq $Null) {
+        throw "AD Container Identifier not found";
     }
-    return $adContainerIdentifier
+    return $adIdentifierInfo.id;
 }
 
 
@@ -469,6 +584,7 @@ function Get-VCenterInfo() {
     }
     return $vcInfo
 }
+
 
 # Example allowed values are DESKTOP, FARM, MACHINE
 function Get-ValidateNameStatus() {
@@ -659,11 +775,485 @@ function Get-NetworkLabelByClusterID() {
     return $identifier
 }
 
+#
+# Credits to Matt Frey for adding it as helper method
+#
+function New-DesktopPool() {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfoParam,
+
+        # Desktop pool Name. Set a unique name each time
+        [Parameter(Mandatory = $true)]
+        [string]
+        $desktopPoolName,
+
+        # Desktop pool Display Name. Set a unique name each time
+        [Parameter(Mandatory = $true)]
+        [string]
+        $displayName,
+
+        # Name pattern of VMs
+        [Parameter(Mandatory = $true)]
+        [string]
+        $desktopNamePattern,
+
+        # Change to custom access group name when required
+        [Parameter(Mandatory = $false)]
+        [string]
+        $accessGroupName = "Root",
+
+        # dns name of domain to get matched for domain identification
+        [Parameter(Mandatory = $true)]
+        [string]
+        $icDomainDNS,
+
+        # Admin user account registered in horizon
+        [Parameter(Mandatory = $true)]
+        [string]
+        $icDomainAdminName,
+
+        # Container path where the Instant Clone machines accounts gets created in AD
+        [Parameter(Mandatory = $true)]
+        [string]
+        $adContainerVDI,
+
+        # Enter the vCenter address or hostname registered with horizon. If horizon uses hostname of Vcenter, do not enter IP address
+        [Parameter(Mandatory = $true)]
+        [string]
+        $Vcenter,
+
+        # Set the value suitable for your environment for using it as master image for desktop pool creation
+        [Parameter(Mandatory = $true)]
+        [string]
+        $baseImage,
+
+        # Update this value for automation.
+        [Parameter(Mandatory = $true)]
+        [string]
+        $baseImageSnapshot,
+
+        # Datacenter Name
+        [Parameter(Mandatory = $true)]
+        [string]
+        $datacenter,
+
+        # VM Folder Path in Datacenter. Update this value for automation.
+        [Parameter(Mandatory = $true)]
+        [string]
+        $vmFolderPath,
+
+        # cluster path. Modify it for automation needs
+        [Parameter(Mandatory = $true)]
+        [string]
+        $clusterPath,
+
+        # Customizable input
+        [Parameter(Mandatory = $true)]
+        [string]
+        $ResourcesPath,
+
+        # Use the desired datastore path. For now adding one DS path. Extend it according to the needs.
+        [Parameter(Mandatory = $true)]
+        [string]
+        $dataStorePath,
+
+        # Set the name of NIC card for finding identifier from list
+        [Parameter(Mandatory = $false)]
+        [string]
+        $nicName,
+
+        # Change to the desired network name
+        [Parameter(Mandatory = $false)]
+        [string]
+        $networkLabelName,
+
+        [Parameter(Mandatory = $false)]
+        [int]
+        $MinimumCount = 1,
+        
+        [Parameter(Mandatory = $true)]
+        [int]
+        $MaximumCount,
+
+        [Parameter(Mandatory = $true)]
+        [int]
+        $SpareCount,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $provisioningTime = "UP_FRONT",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $userAssignment = "FLOATING",
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $allowUsersToResetMachines = $false,
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $allowMultipleSessionsPerUser = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $deleteOrRefreshMachineAfterLogoff = "DELETE",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $refreshOsDiskAfterLogoff = "NEVER",
+
+        [Parameter(Mandatory = $false)]
+        [string[]]
+        $supportedDisplayProtocols =  @('PCOIP', 'RDP', 'BLAST'),
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $renderer3D = "MANAGE_BY_VSPHERE_CLIENT",
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $enableGRIDvGPUs = $false,
+
+        [Parameter(Mandatory = $false)]
+        [int]
+        $maxNumberOfMonitors = 2,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $maxResolutionOfAnyOneMonitor = "WUXGA",
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $useViewStorageAccelerator = $false,
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $enableProvisioning = $true,
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $stopProvisioningOnError = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $namingMethod = "PATTERN",
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $reclaimVmDiskSpace = $false,
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $redirectWindowsProfile = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $storageOvercommit = "UNBOUNDED",
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $useNativeSnapshots = $false,
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $useVsan = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $defaultDisplayProtocol = "BLAST",
+
+        [Parameter(Mandatory = $false)]
+        [bool]
+        $allowUsersToChooseProtocol = $true,
+
+        [Parameter(Mandatory = $false)]
+        [Int]
+        $automaticLogoffMinutes = 120,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $automaticLogoffPolicy = "AFTER",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $powerOffScriptName = "",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $powerOffScriptParameters = "",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $postSynchronizationScriptName = "",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $postSynchronizationScriptParameters = "",
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $primingComputerAccount = ""
+
+    )
+
+
+    # Start fetching identifiers for invoking create desktop pool #
+
+    $icDomainInfo = Get-ADDomainInfo $sessionInfoParam $icDomainDNS $icDomainAdminName
+
+    $icDomainID = $icDomainInfo.base.domain
+
+    Write-Host $icDomainID
+
+    $adContainerIdentifier = Get-ADContainerIdentifier $sessionInfoParam $icDomainID $adContainerVDI
+    Write-Host $adContainerIdentifier
+
+    $vCenterInfo = Get-VCenterInfo $sessionInfoParam $Vcenter
+    $vCenterIdentifier = $vCenterInfo.id
+    # Write-Host $vCenterIdentifier
+
+    $returnValues = Get-BaseImageAndDataCenterIdentifier $sessionInfoParam $vCenterIdentifier $baseImage
+
+    $baseImageIdentifier = $returnValues.baseImageIdentifier;
+    $baseImageDataCenterIdentifier = $returnValues.baseImageDataCenterIdentifier;
+
+    # Write-Host $baseImageIdentifier
+    # Write-Host $baseImageDataCenterIdentifier
+
+    $baseImageSnapshotIdentifier = Get-BaseSnapshotIdentifier $sessionInfoParam $baseImageIdentifier $baseImageSnapshot
+
+    # Write-Host $baseImageSnapshotIdentifier
+
+    $vmfolderIdentifier = Get-VMFolderIdentifier $sessionInfoParam $baseImageDataCenterIdentifier $vmFolderPath
+
+    # Write-Host $vmfolderIdentifier
+
+    $clusterIdentifier = Get-HostOrClusterIdentifier $sessionInfoParam $baseImageDataCenterIdentifier $clusterPath
+
+    # Write-Host $clusterIdentifier
+
+    $resourcePathIdentifier = Get-ResourceIdentifier $sessionInfoParam $clusterIdentifier $ResourcesPath
+
+    # Write-Host $resourcePathIdentifier
+
+    $datastoreIdentifier = Get-DataStoreIdentifier $sessionInfoParam $clusterIdentifier $dataStorePath
+    # Write-Host $datastoreIdentifier
+
+    #$nicIdentifier = Get-BaseSnapshotNICIdentifier $sessionInfoParam $baseImageSnapshotIdentifier $nicName
+    # Write-Host $nicIdentifier
+
+    #$networkLabelId = Get-NetworkLabelByClusterID $sessionInfoParam $clusterIdentifier $networkLabelName
+    # Write-Host $networkLabelId
+
+    $accessGroupInfo = Get-AccessGroupInfo $sessionInfoParam $accessGroupName
+    $accessGroupID = $accessGroupInfo.id
+
+    $icDomainAdminID = $icDomainInfo.id;
+
+    $minNumOfMachines = $MinimumCount;
+    if ($provisioningTime -eq "UP_FRONT") {
+        $minNumOfMachines = $MaximumCount;
+    }   
+    # Replace the hardcoded values with powershell variables where required.
+    $desktopCreatePayload = @{
+        base = @{
+            name = "$desktopPoolName"
+            accessGroup = "$accessGroupID"
+            displayName = "$displayName"
+        }
+        desktopSettings = @{
+            enabled = $true
+            cloudManaged = $false
+            cloudAssigned = $false
+            connectionServerRestrictions = $null
+            supportedSessionType = "DESKTOP"
+            displayAssignedMachineName = $false
+            displayMachineAlias = $false
+            clientRestrictions = $false
+            logoffSettings = @{
+                powerPolicy = "ALWAYS_POWERED_ON"
+                automaticLogoffPolicy = "$automaticLogoffPolicy"
+                automaticLogoffMinutes = $automaticLogoffMinutes
+                allowUsersToResetMachines = $allowUsersToResetMachines
+                allowMultipleSessionsPerUser = $allowMultipleSessionsPerUser
+                refreshOsDiskAfterLogoff = "$refreshOsDiskAfterLogoff"
+                refreshPeriodDaysForReplicaOsDisk = 1
+                refreshThresholdPercentageForReplicaOsDisk = 1
+                emptySessionTimeoutPolicy = "AFTER"
+                emptySessionTimeoutMinutes = 1
+                preLaunchSessionTimeoutPolicy = "AFTER"
+                preLaunchSessionTimeoutMinutes = 10
+                logoffAfterTimeout = $false
+                deleteOrRefreshMachineAfterLogoff = "$deleteOrRefreshMachineAfterLogoff"
+            }
+            displayProtocolSettings  = @{
+                supportedDisplayProtocols =  $supportedDisplayProtocols
+                defaultDisplayProtocol = "$defaultDisplayProtocol"
+                allowUsersToChooseProtocol = $allowUsersToChooseProtocol
+                pcoipDisplaySettings  = @{
+                    renderer3D = $renderer3D
+                    enableGRIDvGPUs = $enableGRIDvGPUs
+                    vRamSizeMB = 96
+                    maxNumberOfMonitors = $maxNumberOfMonitors
+                    maxResolutionOfAnyOneMonitor = "$maxResolutionOfAnyOneMonitor"
+                }
+                enableCollaboration = $false
+            }
+            mirageConfigurationOverrides  = @{
+                overrideGlobalSetting = $false
+                enabled = $false
+            }
+            shortcutLocations = $null
+        }
+        type = "AUTOMATED"
+        automatedDesktopSpec  = @{
+            provisioningType = "INSTANT_CLONE_ENGINE"
+            virtualCenter = "$vCenterIdentifier"
+            userAssignment  = @{
+                userAssignment = "$userAssignment"
+                automaticAssignment = $true
+                allowMultipleAssignments = $false
+            }
+            vmNamingSpec  = @{
+                namingMethod = "$namingMethod"
+                patternNamingSettings  = @{
+                    namingPattern = "$desktopNamePattern"
+                    maxNumberOfMachines = "$MaximumCount"
+                    minNumberOfMachines = "$minNumOfMachines"
+                    numberOfSpareMachines = $SpareCount
+                    provisioningTime = "$provisioningTime"
+                }
+            }
+            virtualCenterProvisioningSettings  = @{
+                enableProvisioning = $enableProvisioning
+                stopProvisioningOnError = $stopProvisioningOnError
+                minReadyVMsOnVComposerMaintenance = 0
+                addVirtualTPM = $false
+                virtualCenterStorageSettings  = @{
+                    datastores = @(
+                        @{
+                            datastore = "$datastoreIdentifier"
+                            sdrsCluster = $false
+                            storageOvercommit = "$storageOvercommit"
+                        }
+                    )
+                    useVSan = $useVSan
+                    viewStorageAcceleratorSettings  = @{
+                        useViewStorageAccelerator = $useViewStorageAccelerator
+                        viewComposerDiskTypes = "OS_DISKS"
+                        regenerateViewStorageAcceleratorDays = 7
+                        blackoutTimes = $null
+                    }
+                    viewComposerStorageSettings  = @{
+                        useSeparateDatastoresReplicaAndOSDisks = $false
+                        useNativeSnapshots = $useNativeSnapshots
+                        spaceReclamationSettings  = @{
+                            reclaimVmDiskSpace = $reclaimVmDiskSpace
+                            reclamationThresholdGB = 1
+                        }
+                        persistentDiskSettings  = @{
+                            redirectWindowsProfile = $redirectWindowsProfile
+                            useSeparateDatastoresPersistentAndOSDisks = $false
+                            diskSizeMB = 2048
+                            persistentDiskDatastores = $null
+                        }
+                        nonPersistentDiskSettings  = @{
+                            redirectDisposableFiles = $false
+                            diskSizeMB = 4096
+                        }
+                    }
+                }
+                virtualCenterNetworkingSettings  = @{}
+                virtualCenterProvisioningData  = @{
+                    datacenter = "$baseImageDataCenterIdentifier"
+                    vmFolder = "$vmfolderIdentifier"
+                    hostOrCluster = "$clusterIdentifier"
+                    resourcePool = "$resourcePathIdentifier"
+                    parentVm = "$baseImageIdentifier"
+                    snapshot = "$baseImageSnapshotIdentifier"
+                }
+            }
+            virtualCenterManagedCommonSettings  = @{
+                transparentPageSharingScope = "VM"
+            }
+            customizationSettings  = @{
+                customizationType = "CLONE_PREP"
+                noCustomizationSettings  = @{
+                    doNotPowerOnVMsAfterCreation = $false
+                }
+                adContainer = "$adContainerIdentifier"
+                reusePreExistingAccounts = $false
+                instantCloneEngineDomainAdministrator  = @{
+                    id = "$icDomainAdminID"
+                    base  = @{
+                        domain = "$icDomainID"
+                        userName = "$icDomainAdminName"
+                        password = @(42, 42, 42, 42, 42, 42, 42, 42)
+                    }
+                    namesData  = @{
+                        dnsName = "$icDomainDNS"
+                    }
+                }
+                cloneprepCustomizationSettings  = @{
+                    #powerOffScriptName = $powerOffScriptName
+                    #powerOffScriptParameters = $powerOffScriptParameters
+                    #postSynchronizationScriptName = $postSynchronizationScriptName
+                    #postSynchronizationScriptParameters = $postSynchronizationScriptParameters
+                    #primingComputerAccount = $primingComputerAccount
+                }
+            }
+        }
+    };
+
+    $desktopIdentifier = Add-DesktopPool $sessionInfoParam $desktopCreatePayload
+    if ($desktopIdentifier) {
+        Write-Host "Desktop pool `"$desktopPoolName`" created successfully!"
+    }
+
+}
+
+###############################################################################
+# @Author: Neha Agarwal
+# Description: Helper to add virtual machines to existing manual desktop pool
+##############################################################################
+function Invoke-AddVMToManualDesktopPool() {
+	param(
+        [Parameter(Mandatory = $true)]
+		$sessionInfo , 
+        [Parameter(Mandatory = $true)]
+		$virtualMachinesList,
+        [Parameter(Mandatory = $true)]
+		$vmNameList,
+        [Parameter(Mandatory = $true)]
+        $desktopIdentifier
+	)
+	$vmIdList = [System.Collections.ArrayList]@()
+    foreach($vmdata in $virtualMachinesList) {
+		foreach($vmName in $vmNameList) {
+			
+			if ( $vmName -eq $vmdata.name ) {
+			    # Make sure that it is the correct vm to add 
+				if( !$vmdata.incompatibleReasons.inUseByLocalDesktop -And !$vmdata.incompatibleReasons.unsupportedOS -And !$vmdata.incompatibleReasons.viewComposerReplica -And !$vmdata.incompatibleReasons.instantInternal ) {
+					$null = $vmIdList.Add($vmdata.id)
+				}
+			}
+		}
+    }
+    Write-Host $vmIdList
+    if ($vmIdList) {
+       Add-MachinesToManualDesktop $sessionInfo $desktopIdentifier $vmIdList
+    }
+}
+
+
 Export-ModuleMember -Function Invoke-LoginCS, Invoke-LogoutCS
 
-Export-ModuleMember -Function Get-ADDomainList, Get-ADContainerByRDN, Add-DesktopPool
+Export-ModuleMember -Function Get-ADDomainList, Get-ADContainerByRDN, Get-ADContainerByDomain, Add-DesktopPool, Get-DesktopPoolByName, Add-MachinesToManualDesktop
 
-Export-ModuleMember -Function Get-VirtualCenterList, Get-VSANConfigStatus, Invoke-ValidateName
+Export-ModuleMember -Function Get-VirtualCenterList, Get-VSANConfigStatus, Invoke-ValidateName, Get-VirtualMachineList
 
 Export-ModuleMember -Function Get-BaseImageVMList, Get-BaseImageSnapshotList, Get-BaseImageSnapshotNICs, Get-VMFolderTree, Get-HostOrClusterTree, Get-ResourcePoolTree, Get-DataStoreList, Convert-TreeAsHashMap
 
@@ -680,3 +1270,5 @@ Export-ModuleMember -Function Get-NetworkLabelByClusterID, Get-BaseSnapshotNICId
 Export-ModuleMember -Function Get-HostOrClusterIdentifier, Get-VMFolderIdentifier, Get-BaseSnapshotIdentifier, Get-BaseImageAndDataCenterIdentifier
 
 Export-ModuleMember -Function Get-ValidateNameStatus, Get-VCenterInfo, Get-ADContainerIdentifier, Get-ADDomainInfo, Send-LoginCS
+
+Export-ModuleMember -Function New-DesktopPool, Invoke-AddVMToManualDesktopPool

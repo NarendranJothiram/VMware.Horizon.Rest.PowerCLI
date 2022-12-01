@@ -1,269 +1,159 @@
-﻿#######################################
+﻿# Requires -Modules VMware.Horizon.VLSI, VMware.Hv.Helper, VMware.PowerCLI
+#######################################
 # @Author Narendran Jothiram
 # Horizon Engineer, EUC
+#
+# Modified By: Matt Frey
+# Consulting Architect, EUC PSO
 #######################################
 
-# Example: Powershell module location --> C:\Program Files\WindowsPowerShell\Modules.
+# Example: Powershell module location --> C:\Program Files\WindowsPowerShell\Modules or C:\Users\username\Documents\PowerShell\Modules.
 # Place the folder VMWare.Horizon.VLSI in this location for Import to work
+
+# Uncomment this to load the module from current folder location
+# Import-Module "$PSScriptRoot\VMware.Horizon.VLSI\1.0\VMware.Horizon.VLSI.psm1" -Force
 
 Import-Module VMware.Horizon.VLSI -Force
 
-function AddDesktopPool() {
+#Global Settings
+#Uses the Splatting method
+#See https://learn.microsoft.com/en-us/powershell/scripting/learn/deep-dives/everything-about-hashtable?view=powershell-7.2
+#for information about 'Splatting hashtables at cmdlets'
+$Parameters = @{
+    Vcenter = "myVcenter.FQDN"
+    baseImage = "win11Staff"
+    datacenter = "SDDC-Datacenter"
+    dataStorePath = "/SDDC-Datacenter/host/Cluster-1/WorkloadDatastore"
+    icDomainAdminName = "svcIC"
+    clusterPath = "/SDDC-Datacenter/host/Cluster-1"
+    ResourcesPath = "/SDDC-Datacenter/host/Cluster-1/Resources/Compute-ResourcePool/Horizon Resources"
+    icDomainDNS ="vmwarepso.org"
+    baseImageSnapshot = "windows 11 June Updates"
+    #Generic Horizon Settings
+    desktopNamePattern = "IC-AUTO-VLSI{n:fixed=3}" # for example
+    UserAssignment = "FLOATING" # or DEDICATED
+    #"AutomaticAssignment" = $true # or $false
+    allowUsersToResetMachines = $false # or $true
+    allowMultipleSessionsPerUser = $false # or $true
+    deleteOrRefreshMachineAfterLogoff = "DELETE" # REFRESH, DELETE or NEVER -lof
+    refreshOsDiskAfterLogoff = "NEVER"
+    supportedDisplayProtocols = @("BLAST") # optional "PCOIP"
+    renderer3D = "MANAGE_BY_VSPHERE_CLIENT" # or DISABLED, AUTOMATIC, SOFTWARE, or HARDWARE
+    enableGRIDvGPUs = $false
+    maxNumberOfMonitors = 2
+    maxResolutionOfAnyOneMonitor = "WUXGA"
+    #"quality" = "NO_CONTROL" #or HIGH LOW MEDIUM #Controls Flash Redirection Quality - No longer present in Horizon
+    #"throttling" = "DISABLED" #or AGGRESIVE CONSERVATIVE DISABLED MODERATE Controls Flash Redirection Throttling - No longer present in Horizon
+    # "overrideGlobalSetting" = $false # or $true #only needed for when Mirage is in use (EOL)
+    #"UseSeparateDatastoresReplicaAndOSDisks" = $false # or $true #only applies to Composer Linked-clones
+    UseViewStorageAccelerator = $false # or $true # not supported with Instant Clones, must be set to $false
+    EnableProvisioning = $true # or $false
+    NamingMethod = "PATTERN"
+    ReclaimVmDiskSpace = $false # or $true
+    RedirectWindowsProfile = $false # or $true
+    stopProvisioningOnError = $true # or $true
+    StorageOvercommit = "UNBOUNDED"
+    UseNativeSnapshots = $false # or $true
+    #"UseSeparateDatastoresPersistentAndOSDisks" = $false # or $true  #only needed for when $RedirectWindowsProfile is $true
+    UseVSAN = $true # or $false
+    #"enableHTMLAccess" = $false # or $true # deprecated, defaults to $true - controlled by selecting or desecting feature during installation of Horizon Agent
+    defaultDisplayProtocol = "BLAST"
+    AutomaticLogoffMinutes = 120
+    allowUsersToChooseProtocol = $false
+    AutomaticLogoffPolicy = "NEVER" #IMMEDIATELY or NEVER or AFTER
+    postSynchronizationScriptName = ""
+    postSynchronizationScriptParameters = ""
+}
 
-    param(
-        $sessionInfoParam
-    )
+#Select Environment
+$Environment = "VMC" # or USERACCEPTANCETESTING or PRODUCTION
 
-    # Desktop pool Name. Set a unique name each time
-    $desktopPoolName="Win11Staff"
-
-    # Name pattern of VMs
-    $desktopNamePattern="Win11Staff-{n}"
-
-    # Change to custom access group name when required
-    $accessGroupName="Root"
-
-    # dns name of domain to get matched for domain identification
-    $icDomainDNS='viewchild.view.nj'
-
-    # Admin user account registered in horizon
-    $icDomainAdminName='administrator'
-
-    # Container path where the Instant Clone machines accounts gets created in AD
-    $adContainerVDI="OU=Containers,OU=HorizonGroups"
-
-    # Enter the vCenter address or hostname registered with horizon. If horizon uses hostname of Vcenter, do not enter IP address
-    $Vcenter = "vCenterIPAddrOrHostName"
-
-    # Set the value suitable for your environment for using it as master image for desktop pool creation
-    $baseImagePath="/HorizonWorld/vm/Discovered virtual machine/Win10Ent"
-
-    # Update this value for automation.
-    $baseImageSnapshotPath = "/ShapshotPathOfVMImage"
-
-    # VM Folder Path in Datacenter. Update this value for automation.
-    $vmFolderPath = "/HorizonWorld/vm/Discovered virtual machine/Floating87"
-
-    # cluster path. Modify it for automation needs
-    $clusterPath="/HorizonWorld/host/HorizonResources"
-
-    # Customizable input
-    $ResourcesPath="/HorizonWorld/host/HorizonResources/Resources"
-
-    # Use the desired datastore path. For now adding one DS path. Extend it according to the needs.
-    $dataStorePath="/HorizonWorld/host/HorizonResources/NJDS1TB"
-
-    # Set the name of NIC card for finding identifier from list
-    $nicName="Network adapter 1"
-
-    # Change to the desired network name
-    $networkLabelName="DVPortGroupFOUR"
-
-    # Start fetching identifiers for invoking create desktop pool #
-
-    $icDomainInfo = Get-ADDomainInfo $sessionInfoParam $icDomainDNS $icDomainAdminName
-    
-    $icDomainID = $icDomainInfo.base.domain
-
-    Write-Host $icDomainID
-
-    $adContainerIdentifier = Get-ADContainerIdentifier $sessionInfoParam $icDomainID $adContainerVDI
-    Write-Host $adContainerIdentifier
-
-    $vCenterInfo = Get-VCenterInfo $sessionInfoParam $Vcenter
-    $vCenterIdentifier = $vCenterInfo.id
-    # Write-Host $vCenterIdentifier
-
-    $returnValues = Get-BaseImageAndDataCenterIdentifier $sessionInfoParam $vCenterIdentifier $baseImagePath
-
-    $baseImageIdentifier = $returnValues.baseImageIdentifier;
-    $baseImageDataCenterIdentifier = $returnValues.baseImageDataCenterIdentifier;
-
-    # Write-Host $baseImageIdentifier
-    # Write-Host $baseImageDataCenterIdentifier
-
-    $baseImageSnapshotIdentifier = Get-BaseSnapshotIdentifier $sessionInfoParam $baseImageIdentifier $baseImageSnapshotPath
-
-    # Write-Host $baseImageSnapshotIdentifier
-
-    $vmfolderIdentifier = Get-VMFolderIdentifier $sessionInfoParam $baseImageDataCenterIdentifier $vmFolderPath
-
-    # Write-Host $vmfolderIdentifier
-
-    $clusterIdentifier = Get-HostOrClusterIdentifier $sessionInfoParam $baseImageDataCenterIdentifier $clusterPath
-
-    # Write-Host $clusterIdentifier
-
-    $resourcePathIdentifier = Get-ResourceIdentifier $sessionInfoParam $clusterIdentifier $ResourcesPath
-
-    # Write-Host $resourcePathIdentifier
-
-    $datastoreIdentifier = Get-DataStoreIdentifier $sessionInfoParam $clusterIdentifier $dataStorePath
-    # Write-Host $datastoreIdentifier
-
-    $nicIdentifier = Get-BaseSnapshotNICIdentifier $sessionInfoParam $baseImageSnapshotIdentifier $nicName
-    # Write-Host $nicIdentifier
-
-    $networkLabelId = Get-NetworkLabelByClusterID $sessionInfoParam $clusterIdentifier $networkLabelName
-    # Write-Host $networkLabelId
-
-    $accessGroupInfo = Get-AccessGroupInfo $sessionInfoParam $accessGroupName
-    $accessGroupID = $accessGroupInfo.id
-
-    $icDomainAdminID = $icDomainInfo.id;
-
-    # Replace the hardcoded values with powershell variables where required.
-    $desktopCreatePayload = @{ 
-	    base = @{
-		    name = "$desktopPoolName"
-		    accessGroup = "$accessGroupID"
-	    }
-	    desktopSettings = @{
-		    enabled = $true
-		    cloudManaged = $false
-		    cloudAssigned = $false
-		    connectionServerRestrictions = $null
-		    supportedSessionType = "DESKTOP"
-		    displayAssignedMachineName = $false
-		    displayMachineAlias = $false
-		    clientRestrictions = $false
-		    logoffSettings = @{
-			    powerPolicy = "ALWAYS_POWERED_ON"
-			    automaticLogoffPolicy = "NEVER"
-			    automaticLogoffMinutes = 120
-			    allowUsersToResetMachines = $false
-			    allowMultipleSessionsPerUser = $false
-			    refreshOsDiskAfterLogoff = "NEVER"
-			    refreshPeriodDaysForReplicaOsDisk = 1
-			    refreshThresholdPercentageForReplicaOsDisk = 1
-			    emptySessionTimeoutPolicy = "AFTER"
-			    emptySessionTimeoutMinutes = 1
-			    preLaunchSessionTimeoutPolicy = "AFTER"
-			    preLaunchSessionTimeoutMinutes = 10
-			    logoffAfterTimeout = $false
-			    deleteOrRefreshMachineAfterLogoff = "DELETE"
-		    }
-		    displayProtocolSettings  = @{
-			    supportedDisplayProtocols =  @('PCOIP', 'RDP', 'BLAST')
-			    defaultDisplayProtocol = "BLAST"
-			    allowUsersToChooseProtocol = $true
-			    pcoipDisplaySettings  = @{
-				    renderer3D = "MANAGE_BY_VSPHERE_CLIENT"
-				    enableGRIDvGPUs = $false
-				    vRamSizeMB = 96
-				    maxNumberOfMonitors = "2"
-				    maxResolutionOfAnyOneMonitor = "WUXGA"
-			    }
-			    enableCollaboration = $false
-		    }
-		    mirageConfigurationOverrides  = @{
-			    overrideGlobalSetting = $false
-			    enabled = $false
-		    }
-	    }
-	    type = "AUTOMATED"
-	    automatedDesktopSpec  = @{
-		    provisioningType = "INSTANT_CLONE_ENGINE"
-		    virtualCenter = "$vCenterIdentifier"
-		    userAssignment  = @{
-			    userAssignment = "FLOATING"
-			    automaticAssignment = $true
-			    allowMultipleAssignments = $false
-		    }
-		    vmNamingSpec  = @{
-			    namingMethod = "PATTERN"
-			    patternNamingSettings  = @{
-				    namingPattern = "$desktopNamePattern"
-				    maxNumberOfMachines = 1
-				    numberOfSpareMachines = 1
-				    provisioningTime = "UP_FRONT"
-			    }
-		    }
-		    virtualCenterProvisioningSettings  = @{
-			    enableProvisioning = $true
-			    stopProvisioningOnError = $true
-			    minReadyVMsOnVComposerMaintenance = 0
-			    addVirtualTPM = $false
-			    virtualCenterStorageSettings  = @{
-				    datastores = @(
-                        @{
-						    datastore = "$datastoreIdentifier"
-						    sdrsCluster = $false
-						    storageOvercommit = "UNBOUNDED"
-					    }
-                    )
-				    useVSan = $false
-				    viewStorageAcceleratorSettings  = @{
-					    useViewStorageAccelerator = $true
-					    viewComposerDiskTypes = "OS_DISKS"
-					    regenerateViewStorageAcceleratorDays = 7
-					    blackoutTimes = $null
-				    }
-				    viewComposerStorageSettings  = @{
-					    useSeparateDatastoresReplicaAndOSDisks = $false
-					    useNativeSnapshots = $false
-					    spaceReclamationSettings  = @{
-						    reclaimVmDiskSpace = $false
-						    reclamationThresholdGB = 1
-					    }
-					    persistentDiskSettings  = @{
-						    redirectWindowsProfile = $false
-						    useSeparateDatastoresPersistentAndOSDisks = $false
-						    diskSizeMB = 2048
-						    persistentDiskDatastores = $null
-					    }
-					    nonPersistentDiskSettings  = @{
-						    redirectDisposableFiles = $false
-						    diskSizeMB = 4096
-					    }
-				    }
-			    }
-			    virtualCenterNetworkingSettings  = @{}
-			    virtualCenterProvisioningData  = @{
-				    datacenter = "$baseImageDataCenterIdentifier"
-				    vmFolder = "$vmfolderIdentifier"
-				    hostOrCluster = "$clusterIdentifier"
-				    resourcePool = "$resourcePathIdentifier"
-				    parentVm = "$baseImageIdentifier"
-				    snapshot = "$baseImageSnapshotIdentifier"
-			    }
-		    }
-		    virtualCenterManagedCommonSettings  = @{
-			    transparentPageSharingScope = "VM"
-		    }
-		    customizationSettings  = @{
-			    customizationType = "CLONE_PREP"
-			    noCustomizationSettings  = @{
-				    doNotPowerOnVMsAfterCreation = $false
-			    }
-			    adContainer = "$adContainerIdentifier"
-			    reusePreExistingAccounts = $false
-			    instantCloneEngineDomainAdministrator  = @{
-				    id = "$icDomainAdminID"
-				    base  = @{
-					    id = "$icDomainID"
-					    userName = "$icDomainAdminName"
-					    password = @(42, 42, 42, 42, 42, 42, 42, 42)
-				    }
-				    namesData  = @{
-					    dnsName = "$icDomainDNS"
-				    }
-			    }
-			    cloneprepCustomizationSettings  = @{}
-		    }
-	    }
-    };
-
-    $desktopIdentifier = Add-DesktopPool $sessionInfoParam $desktopCreatePayload
-    if ($desktopIdentifier) {
-        Write-Host "Desktop pool `"$desktopPoolName`" created successfully!"
+If ($environment -eq "PRODUCTION")
+    {
+        $EnvironmentParams = @{
+            desktopPoolName = "PRODUCTION"
+            displayName = "PRODUCTION"
+            ProvTime = "UP_FRONT"
+            vmFolderPath  = "</DATASTORE/FOLDER>"
+            MaximumCount = 5
+            SpareCount = 1
+            #NumUnassignedMachinesKeptPoweredOn = 1 #only applies when using specified naming
+            AdContainer = "OU=Production,OU=AMER,OU=Virtual Desktop Clones,OU=Workstations"
+        }
     }
 
-}
+If ($environment -eq "USERACCEPTANCETESTING")
+    {
+        $EnvironmentParams = @{
+            desktopPoolName = "USERACCEPTANCETESTING"
+            displayName= "USERACCEPTANCETESTING"
+            ProvTime = "UP_FRONT"
+            vmFolderPath  = "</DATASTORE/FOLDER>"
+            MaximumCount = 5
+            SpareCount = 1
+            #NumUnassignedMachinesKeptPoweredOn = 1 #only applies when using specified naming
+            AdContainer = "OU=Pre-Production,OU=AMER,OU=Virtual Desktop Clones,OU=Workstations"
+        }
+    }
+
+If ($environment -eq "DEVELOPMENT")
+    {
+        $EnvironmentParams = @{
+            desktopPoolName = "DesktopPool1B"
+            displayName= "DesktopPool1B"
+            ProvTime = "UP_FRONT"
+            vmFolderPath   = "/USVA01-HVD-DEV2/vm/ResilientHVD"
+            MaximumCount = 5
+            SpareCount = 2
+            #NumUnassignedMachinesKeptPoweredOn = 1 #only applies when using specified naming
+            AdContainer = "OU=Development,OU=AMER,OU=Virtual Desktop Clones,OU=Workstations"
+        }
+    }
+
+    If ($environment -eq "VMC")
+    {
+        $EnvironmentParams = @{
+            desktopPoolName = "TESTVLSI"
+            displayName= "TEST VLSI Testing"
+            provisioningTime = "UP_FRONT"
+            vmFolderPath   = "/SDDC-Datacenter/vm/Workloads/Users/CreekSideE"
+            MaximumCount = 2
+            SpareCount = 1
+            #NumUnassignedMachinesKeptPoweredOn = 1 #only applies when using specified naming
+            AdContainer = "OU=Non-Persistent,OU=Desktops,OU=Horizon,OU=Objects-Computers"
+        }
+    }
+
+
+#Credentials and Connection Server
+$Credential = Get-Credential
+# Fully Qualified Host name of Connection Server
+$HVServer = "CS002.view.nj"
 
 
 
 # Modify the params as required. Move this to another Ps1 file for execution if required.
-$sessionInfo = Send-LoginCS "administrator" "view.nj" "CS002.view.nj"
-AddDesktopPool $sessionInfo
+$SessionInfo = Send-LoginCS $HVServer "true" $Credential
+# Use IP address or FQDN used while registering VC with CS
+$Vcenter = "x.x.x.x"
+$vCenterInfo = Get-VCenterInfo $SessionInfo $Vcenter
+$vCenterIdentifier = $vCenterInfo.id
+$desktopPoolName="FIC2"
+$desktopData = Get-DesktopPoolByName $SessionInfo $desktopPoolName $vCenterIdentifier
+
+$desktopIdentifier = $desktopData.id
+
+Write-Host ($desktopData | ConvertTo-Json -depth 10)
+
+$virtualMachinesList = Get-VirtualMachineList $SessionInfo $vCenterIdentifier
+
+# Provide list of Virtual Machine name to added
+$vmNameList = @("Win10Net")
+#Sample code to add machine to existing manual desktop pool
+Invoke-AddVMToManualDesktopPool $SessionInfo $virtualMachinesList $vmNameList $desktopIdentifier
+
+
+# Uncomment this to test New-DesktopPool API
+# New-DesktopPool $SessionInfo @Parameters @EnvironmentParams
+
 Invoke-LogoutCS $sessionInfo
