@@ -46,17 +46,25 @@ function Invoke-LoginCS() {
         [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCertsPolicy]::new()
     }
     Write-Host "Send login request " $uri
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $uri `
-    -Method "POST" `
-    -WebSession $session `
-    -Headers $headers `
-    -ContentType "application/json; charset=UTF-8" `
-    -Body $bodyContent;
-    $csrfToken = $response.Headers['CSRFToken']
-    $headers.Add('CSRFToken', $csrfToken)
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $uri `
+        -Method "POST" `
+        -WebSession $session `
+        -Headers $headers `
+        -ContentType "application/json; charset=UTF-8" `
+        -Body $bodyContent;
+        if($response -ne $null) {
+            $csrfToken = $response.Headers['CSRFToken']
+            $headers.Add('CSRFToken', $csrfToken)
 
-    return @{"urlPrefix"= "https://$csName/$urlPrefix"; "session"= $session;
-    "headers"= $headers}
+            return @{"urlPrefix"= "https://$csName/$urlPrefix"; "session"= $session;
+            "headers"= $headers}
+        }
+        return $null
+    } catch {
+       Write-Host $_
+       throw "Login failed on $server"
+    }
 }
 
 function Invoke-LogoutCS() {
@@ -125,7 +133,7 @@ function Invoke-HorizonPostMethod() {
     try {
         $uriPrefix = $sessionInfo.urlPrefix
         $uri = "$uriPrefix/$uriSuffix"
-        $payloadJSON = $payload | ConvertTo-Json -Depth 10
+        $payloadJSON =  (ConvertTo-Json -Depth 10 $payload)
         Write-Host "POST -> " $uri 
         $response = Invoke-RestMethod -UseBasicParsing -Uri $uri `
             -Method "POST" `
@@ -315,6 +323,17 @@ function Get-AccessGroupList() {
     }
 }
 
+function Get-GlobalAccessGroupList() {
+    param(
+        $sessionInfo
+    )
+    try {
+        return Invoke-HorizonGetMethod $sessionInfo "GlobalAccessGroup/list"
+    } catch {
+       Write-Host $_
+    }
+}
+
 function Get-AccessGroupInfo() {
     param(
         $sessionInfo,
@@ -328,7 +347,23 @@ function Get-AccessGroupInfo() {
             break
         }
     }
-    return $accessGroupInfo;
+    return $accessGroupInfo
+}
+
+function Get-GlobalAccessGroupInfo() {
+    param(
+        $sessionInfo,
+        $accessGroupName
+    )
+    $accessGroupList = Get-GlobalAccessGroupList $sessionInfo
+    $accessGroupInfo = ""
+    foreach($data in $accessGroupList) {
+        if ($data.base.name -eq $accessGroupName) {
+            $accessGroupInfo = $data
+            break
+        }
+    }
+    return $accessGroupInfo
 }
 
 function Get-RootAccessGroupID() {
@@ -343,7 +378,22 @@ function Get-RootAccessGroupID() {
             break
         }
     }
-    return $rootAccessID;
+    return $rootAccessID
+}
+
+function Get-RootGlobalAccessGroupID() {
+    param(
+        $sessionInfo
+    )
+    $accessGroupList = Get-GlobalAccessGroupList $sessionInfo
+    $rootAccessID = ""
+    foreach($data in $accessGroupList) {
+        if ($data.base.name -eq "Root") {
+            $rootAccessID = $data.id
+            break
+        }
+    }
+    return $rootAccessID
 }
 
 function Get-VSANConfigStatus() {
@@ -394,6 +444,27 @@ function Convert-TreeAsHashMap() {
     }
 }
 
+##
+# For View API, query identifier is returned for query services and it has to be deleted for cleaning up the resources after its use.
+##
+function Clear-QueryById() {
+     param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfo,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $queryID
+    )
+    # Cleanup the query resources
+    $payload1 = @{ id = $queryID }
+    try {
+        $response = Invoke-HorizonPostMethod $sessionInfo "queryservice/delete" $payload1
+    } catch {
+       Write-Host $_
+       throw "Failed to delete query by identifier $queryID"
+    }
+}
+
 #
 # Get the desktop pool filtered by name and virtual center identifier
 #
@@ -414,14 +485,12 @@ function Get-DesktopPoolByName() {
             value = $desktopPoolName
         }
     }
-    $responseData = $Null;
+    $responseData = $null
     try {
          $responseData = Invoke-HorizonPostMethod $sessionInfo "queryservice/create" $payload
-         if ( $responseData -ne $Null) {
-            Write-Host ($responseData | ConvertTo-JSON -depth 10)
-             # Cleanup the query resources
+         if ( $responseData -ne $null) {
              $payload = @{ id = $responseData.id }
-             Invoke-HorizonPostMethod $sessionInfo "queryservice/delete" $payload
+             Clear-QueryById $sessionInfo $responseData.id             
              if ($responseData.results[0].desktopSummaryData.virtualCenter -eq $vCenterIdentifier) {
                 return $responseData.results[0]
              }
@@ -431,7 +500,7 @@ function Get-DesktopPoolByName() {
     } catch {
        Write-Host $_
     }
-    return $Null
+    return $null
 }
 
 function Add-DesktopPool() {
@@ -467,9 +536,9 @@ function Add-MachinesToManualDesktop()
 
 	try {
        $response = Invoke-HorizonPostMethod $sessionInfo "Desktop/AddMachinesToManualDesktop" $payload
-       if ($response -ne $Null) {
+       if ($response -ne $null) {
             if($response.message -ne $null) {
-                throw "Failed to add machine " + $response
+                throw "Failed to add machine $response"
             } else{
                 Write-Host "Machines added to desktop pool!"
                 return $response
@@ -478,8 +547,123 @@ function Add-MachinesToManualDesktop()
     } catch {
        Write-Host $_
     }
-	return $Null
+	return $null
 }
+
+function Add-CustomRole() {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfoParam,
+
+        # CustomRoleName with only Alphanumeric characters and no space or special chars
+        [Parameter(Mandatory = $true)]
+        [string]
+        $customRoleName,
+
+        # Description about the custom role
+        [Parameter(Mandatory = $true)]
+        [string]
+        $description,
+
+        # Privileges array in the format Example: @("LOG_COLLECTION", "GLOBAL_VIEW")
+        [Parameter(Mandatory = $true)]
+        $privilegesList
+
+    )
+    $payload = @{
+        description=$description
+        privileges=$privilegesList
+        name=$customRoleName
+    }
+    try {
+       $response = Invoke-HorizonPostMethod $sessionInfoParam "Role/Create" $payload
+       if ($response -ne $null) {
+            Write-Host "New custom role $customRoleName with identifier $response created successfully!"
+       }
+    } catch {
+       Write-Host $_
+       throw "Add custom role failed!"
+    }
+
+}
+
+
+##
+# Provided full AD user name as input, it finds the AD user.
+# Sample payload: {"queryEntityType":"ADUserOrGroupSummaryView","startingOffset":0,"limit":1000,"filter":{"type":"And",
+# "filters":[{"type":"Equals","memberName":"base.group","value":false},{"type":"StartsWith","memberName":"base.name","value":"log"},
+# {"type":"Equals","memberName":"base.domain","value":"view.nj"}]}}
+##
+function Find-ADUserByName() {
+     param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfo,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $fullADUserName,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $domainFQDN
+    )
+
+	$payload = @{
+        entityType = "ADUserOrGroupSummaryView"
+        queryEntityType = "ADUserOrGroupSummaryView"
+        limt = 1
+        filter = @{ 
+            type = "And"
+            filters = @(
+                @{
+                    type = "StartsWith"
+                    memberName = "base.name"
+                    value = $fullADUserName
+                },
+                @{
+                    type = "Equals"
+                    memberName = "base.group"
+                    value = $false
+                },
+                @{
+                    type = "Equals"
+                    memberName = "base.domain"
+                    value = $domainFQDN
+                }
+            )
+        }
+    }
+    try {
+         $responseData = Invoke-HorizonPostMethod $sessionInfo "queryservice/create" $payload
+         if ($responseData -ne $null -And $responseData.results -ne $null) {
+             $userInfo = $responseData.results[0]
+             Clear-QueryById $sessionInfo $responseData.id
+             return $userInfo
+         } else {
+             throw "No AD user found!"
+         }
+         
+    } catch {
+       Write-Host $_
+       throw "No AD user found!"
+    }
+}
+
+##
+# List of available roles in horizon enterprise
+##
+function Get-HorizonRoleList() {
+    param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfo
+    )
+    try {
+        return Invoke-HorizonGetMethod $sessionInfo "Role/List"
+    } catch {
+       Write-Host $_
+       throw "List Role API failed to get executed!"
+    }
+}
+
 
 
 ###############
@@ -490,8 +674,11 @@ function Add-MachinesToManualDesktop()
 # Credits to Matt Frey for adding PSCredential
 function Send-LoginCS () {
     param(
+        [Parameter(Mandatory = $true)]
+        [string]
         $servername,
-        
+        [Parameter(Mandatory = $true)]
+        [string]
         $ignoreCert,
         [ValidateNotNull()]
         [System.Management.Automation.PSCredential]
@@ -499,26 +686,110 @@ function Send-LoginCS () {
         $Credential = [System.Management.Automation.PSCredential]::Empty
     )
 
-
+    $loginParams = @{}
     if ($PSBoundParameters.ContainsKey('credential')) {
-
+        $loginParams = @{
+            name = $Credential.GetNetworkCredential().UserName
+            passwd = $Credential.GetNetworkCredential().Password
+            domain = $Credential.GetNetworkCredential().Domain
+        }
+        $server=$servername
     }
-
-    $loginParams = @{
-        name = $Credential.GetNetworkCredential().UserName
-        passwd = $Credential.GetNetworkCredential().Password
-        domain = $Credential.GetNetworkCredential().Domain
-    }
-    $server=$servername
 
     # Session Info required for other API requests on same logged in session.
     # The third parameter to be set as $false for production environments
-    $sessionInfo = Invoke-LoginCS $server $loginParams $true
+    $sessionInfo = Invoke-LoginCS $server $loginParams $ignoreCert
 
     # Reset login payload.
     $loginParams = "";
 
     return $sessionInfo;
+}
+
+function Get-HorizonRoleByName() {
+     param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfo,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $customRoleName
+    )
+    try {
+        $roles = Get-HorizonRoleList $sessionInfo
+        foreach ($role in $roles) {
+            if ($role.base.name -eq $customRoleName) {
+                return $role
+            }
+        }
+    } catch {
+       Write-Host $_
+       throw "List Role API failed to get executed!"
+    }
+    return $null
+}
+
+##
+# Add an user to existing role.
+# Use custom AccessGroupId and GlobalAccessGroupId if granular RBAC required for that user
+##
+function Add-HorizonAdminToRole() {
+    param(
+        [Parameter(Mandatory = $true)]
+        $sessionInfo,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $userId,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $customRoleName,
+        [Parameter(Mandatory = $false)]
+        [string]
+        $accessGroupId,
+        [Parameter(Mandatory = $false)]
+        [string]
+        $globalAccessGroupId
+    )
+    $role = Get-HorizonRoleByName $sessionInfo $customRoleName
+    if ($role) {
+        if (-Not ($psBoundParameters.containsKey('accessGroupId'))) {
+            $accessGroupId = Get-RootAccessGroupID $sessionInfo
+        }
+        if ($role.data.appliesToGlobalAccessGroup) {
+            if (-Not ($psBoundParameters.containsKey('globalAccessGroupId'))) {
+                $globalAccessGroupId = Get-RootGlobalAccessGroupID $sessionInfo
+            }
+        }
+
+        $payload = @(
+            @{
+                userOrGroup = $userId
+                role = $role.id
+                accessGroup = $accessGroupId
+            }
+        )
+        if ($role.data.appliesToGlobalAccessGroup) {
+            $payload = @(
+                @{
+                    userOrGroup = $userId
+                    role = $role.id
+                    accessGroup = $accessGroupId
+                },
+                @{
+                    userOrGroup = $userId
+                    role = $role.id
+                    globalAccessGroup = $globalAccessGroupId
+                }
+            )
+        }
+        try {
+            # uncomment for debugging purpose
+            # Write-Host (ConvertTo-JSON -depth 10 $payload)
+            $responseData = Invoke-HorizonPostMethod $sessionInfo "Permission/CreatePermissions" $payload
+        } catch {
+           Write-Host $_
+           throw "Failed to add user to role $customRoleName"
+        }
+    }
 }
 
 function Get-ADDomainInfo() {
@@ -530,14 +801,14 @@ function Get-ADDomainInfo() {
     $adDomains = Get-ADDomainList $sessionInfo
 
     # Select domain identifier from dnsName and IC domain admin user name
-    $icDomain = $Null
+    $icDomain = $null
     foreach($data in $adDomains) {
        if ($icDomainDNS -eq $data.namesData.dnsName -And $data.base.userName -eq $icDomainAdminName) {
          $icDomain=$data
          break;
        }
     }
-    if ($icDomain -eq $Null) {
+    if ($icDomain -eq $null) {
         throw "AD Domain information not found. Check the domain dnsname input and ensure no space append at the end."
     }
     return $icDomain
@@ -562,7 +833,7 @@ function Get-ADContainerIdentifier() {
         containerId = "$adContainerIdentifier"
     }
     $adIdentifierInfo = Get-ADContainerByDomain $sessionInfo $adContainerByIdPayload
-    if ($adIdentifierInfo -eq $Null) {
+    if ($adIdentifierInfo -eq $null) {
         throw "AD Container Identifier not found";
     }
     return $adIdentifierInfo.id;
@@ -1215,6 +1486,7 @@ function New-DesktopPool() {
 
 }
 
+
 ###############################################################################
 # @Author: Neha Agarwal
 # Description: Helper to add virtual machines to existing manual desktop pool
@@ -1242,10 +1514,29 @@ function Invoke-AddVMToManualDesktopPool() {
 			}
 		}
     }
-    Write-Host $vmIdList
     if ($vmIdList) {
        Add-MachinesToManualDesktop $sessionInfo $desktopIdentifier $vmIdList
     }
+}
+
+###
+# Adds new LogCollectorAdmins custom role with "LOG_COLLECTION" permission.
+###
+function Add-LogCollectorCustomRole() {
+    param(
+        [Parameter(Mandatory = $true)]
+		$sessionInfo,
+        [Parameter(Mandatory = $false)]
+        [string]
+        $customRoleName
+    )
+    $roleName = $customRoleName
+    if (-Not ($psBoundParameters.containsKey('customRoleName'))) {
+        $roleName = "LogCollectorAdmins"
+    }
+    $privileges = @("LOG_COLLECTION")
+    $description = "Allow log collection operations."
+    Add-CustomRole $sessionInfo $roleName $description $privileges
 }
 
 
@@ -1257,7 +1548,9 @@ Export-ModuleMember -Function Get-VirtualCenterList, Get-VSANConfigStatus, Invok
 
 Export-ModuleMember -Function Get-BaseImageVMList, Get-BaseImageSnapshotList, Get-BaseImageSnapshotNICs, Get-VMFolderTree, Get-HostOrClusterTree, Get-ResourcePoolTree, Get-DataStoreList, Convert-TreeAsHashMap
 
-Export-ModuleMember -Function Get-NetworkLabelListByClusterID, Get-RootAccessGroupID, Get-AccessGroupList, Get-AccessGroupInfo, Get-AccessGroupList
+Export-ModuleMember -Function Get-NetworkLabelListByClusterID, Get-RootAccessGroupID, Get-RootGlobalAccessGroupID, Get-AccessGroupList, Get-GlobalAccessGroupList, Get-AccessGroupInfo, Get-GlobalAccessGroupInfo, Get-AccessGroupList
+
+Export-ModuleMember -Function Add-CustomRole, Find-ADUserByName, Clear-QueryById, Get-HorizonRoleList
 
 ## 
 # Export helper methods
@@ -1272,3 +1565,5 @@ Export-ModuleMember -Function Get-HostOrClusterIdentifier, Get-VMFolderIdentifie
 Export-ModuleMember -Function Get-ValidateNameStatus, Get-VCenterInfo, Get-ADContainerIdentifier, Get-ADDomainInfo, Send-LoginCS
 
 Export-ModuleMember -Function New-DesktopPool, Invoke-AddVMToManualDesktopPool
+
+Export-ModuleMember -Function Add-LogCollectorCustomRole, Get-HorizonRoleByName, Add-HorizonAdminToRole

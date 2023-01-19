@@ -11,9 +11,9 @@
 # Place the folder VMWare.Horizon.VLSI in this location for Import to work
 
 # Uncomment this to load the module from current folder location
-# Import-Module "$PSScriptRoot\VMware.Horizon.VLSI\1.0\VMware.Horizon.VLSI.psm1" -Force
+Import-Module "$PSScriptRoot\VMware.Horizon.VLSI\1.0\VMware.Horizon.VLSI.psm1" -Force
 
-Import-Module VMware.Horizon.VLSI -Force
+#Import-Module VMware.Horizon.VLSI -Force
 
 #Global Settings
 #Uses the Splatting method
@@ -132,28 +132,37 @@ $HVServer = "CS002.view.nj"
 
 
 
-# Modify the params as required. Move this to another Ps1 file for execution if required.
+# Modify the params as required. Move this to another Ps1 file for execution if required. Don't Forget to Invoke-LogoutCS after all API executions or use.
 $SessionInfo = Send-LoginCS $HVServer "true" $Credential
-# Use IP address or FQDN used while registering VC with CS
-$Vcenter = "x.x.x.x"
-$vCenterInfo = Get-VCenterInfo $SessionInfo $Vcenter
-$vCenterIdentifier = $vCenterInfo.id
-$desktopPoolName="FIC2"
-$desktopData = Get-DesktopPoolByName $SessionInfo $desktopPoolName $vCenterIdentifier
 
-$desktopIdentifier = $desktopData.id
+if ($SessionInfo -eq $Null) {
+    exit 1
+}
+### START OF ADD MANUAL MACHINE TO DESKTOP POOL
 
-Write-Host ($desktopData | ConvertTo-Json -depth 10)
+# Use IP address or FQDN which was used while registering VC with CS
+# $Vcenter = "x.x.x.x"
+# $vCenterInfo = Get-VCenterInfo $SessionInfo $Vcenter
+# $vCenterIdentifier = $vCenterInfo.id
+# $desktopPoolName="FIC2"
+# $desktopData = Get-DesktopPoolByName $SessionInfo $desktopPoolName $vCenterIdentifier
 
-$virtualMachinesList = Get-VirtualMachineList $SessionInfo $vCenterIdentifier
+# $desktopIdentifier = $desktopData.id
+
+# Write-Host ($desktopData | ConvertTo-Json -depth 10)
+
+
+# $virtualMachinesList = Get-VirtualMachineList $SessionInfo $vCenterIdentifier
 
 # Provide list of Virtual Machine name to added
-$vmNameList = @("Win10Net")
-#Sample code to add machine to existing manual desktop pool
-Invoke-AddVMToManualDesktopPool $SessionInfo $virtualMachinesList $vmNameList $desktopIdentifier
+# $vmNameList = @("Win10Net")
 
+#Sample code to add machine to existing manual desktop pool
+# Invoke-AddVMToManualDesktopPool $SessionInfo $virtualMachinesList $vmNameList $desktopIdentifier
+
+### END OF MANUAL DESKTOP POOL SAMPLE CODE
 
 # Uncomment this to test New-DesktopPool API
 # New-DesktopPool $SessionInfo @Parameters @EnvironmentParams
 
-Invoke-LogoutCS $sessionInfo
+Invoke-LogoutCS $SessionInfo
