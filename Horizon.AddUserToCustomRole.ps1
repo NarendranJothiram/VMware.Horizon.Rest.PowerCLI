@@ -24,7 +24,7 @@ $HVServer = "CS002.view.nj"
 $domainFQDN="view.nj"
 # Only username of AD user.
 $ADUsername="administrator"
-$customLogCollectorRoleName="LogCollectorAdmins1"
+$customLogCollectorRoleName="LogCollectorAdmins"
 
 # Login to the CS. Don't Forget to Invoke-LogoutCS after all API executions or use.
 # While entering Credentials use format, domain\username and provide password in the prompt.
